@@ -2,12 +2,12 @@
 Parivahan Fancy Number Fetcher
 ================================
 Fetches all available/booked registration numbers from the Parivahan
-fancy number website and exports them to a CSV with pattern categories.
-
-Usage:
-    python main.py
+fancy number website and exports them to CSV with pattern categories.
 
 Features:
+- Beautiful CLI with Typer + Rich
+- Interactive multi-select for vehicle series (with Select All)
+- Adds series & final_number columns to CSV
 - Manual login (you handle username, password, OTP, captcha)
 - Incremental CSV writing (saves after every page)
 - Resume support (detects existing CSV and skips already-fetched pages)
@@ -15,12 +15,25 @@ Features:
 """
 
 import csv
-import os
 import re
 import time
-from datetime import datetime
 from pathlib import Path
 
+import typer
+from InquirerPy import inquirer
+from InquirerPy.separator import Separator
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
+from rich.text import Text
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -29,33 +42,48 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+# ─── Typer & Rich setup ─────────────────────────────────────────────────────
+app = typer.Typer(
+    name="fetch-numbers",
+    help="🚗 Fetch fancy car registration numbers from Parivahan",
+    add_completion=False,
+    rich_markup_mode="rich",
+)
+console = Console()
 
-# =============================================================================
-# Configuration
-# =============================================================================
+# ─── Constants ───────────────────────────────────────────────────────────────
 FUEL_TYPE = "PETROL"
-VEHICLE_CATEGORY = "LMV"  # Value for LIGHT MOTOR VEHICLE
-VEHICLE_SERIES = "DL11CG" # DL5CY, DL7CY
+VEHICLE_CATEGORY = "LMV"
 LOGIN_URL = "https://fancy.parivahan.gov.in/"
 HOME_URL = "https://fancy.parivahan.gov.in/fancy/faces/app/applicanthome.xhtml"
 
-# Known background colors:
-# Available: #e4f8e7 → rgba(228, 248, 231, 1)  — light green
-# Booked:    #ff8900 → rgba(255, 137, 0, 1)    — orange
+ALL_SERIES = [
+    "DL1CAK",
+    "DL2CBG",
+    "DL3CDE",
+    "DL4CBF",
+    "DL5CY",
+    "DL6CT",
+    "DL7CY",
+    "DL8CBL",
+    "DL9CBM",
+    "DL10DB",
+    "DL11CG",
+    "DL12DA",
+    "DL14CM",
+]
 
-# Output file (fixed name so we can resume)
 SCRIPT_DIR = Path(__file__).parent
-OUTPUT_FILE = SCRIPT_DIR / f"{VEHICLE_SERIES}_numbers.csv"
+OUTPUT_DIR = SCRIPT_DIR / "OP"
 
-# Delay between page navigations (seconds) — increase if the site is slow
 PAGE_DELAY = 3
 DROPDOWN_DELAY = 4
 NUMBERS_PER_PAGE = 100
 
+CSV_FIELDS = ["series", "number", "final_number", "available", "category"]
 
-# =============================================================================
-# Number Pattern Categorization
-# =============================================================================
+
+# ─── Number Pattern Categorization ──────────────────────────────────────────
 def categorize_number(num_str: str) -> str:
     """Categorize a 4-digit number string into a pattern category."""
     if len(num_str) != 4 or not num_str.isdigit():
@@ -63,39 +91,23 @@ def categorize_number(num_str: str) -> str:
 
     a, b, c, d = num_str
 
-    # XXXX - All same (e.g., 1111)
     if a == b == c == d:
         return "XXXX"
-
-    # XYYY - First different, last 3 same (e.g., 1222)
     if b == c == d and a != b:
         return "XYYY"
-
-    # YYYX - First 3 same, last different (e.g., 2221)
     if a == b == c and d != a:
         return "YYYX"
-
-    # XXYY - First 2 same, last 2 same (e.g., 1122)
     if a == b and c == d and a != c:
         return "XXYY"
-
-    # XYXY - Alternating pair (e.g., 1212)
     if a == c and b == d and a != b:
         return "XYXY"
-
-    # XYYX - Palindrome (e.g., 1221)
     if a == d and b == c and a != b:
         return "XYYX"
-
-    # XXYZ - First 2 same, last 2 different from each other and from first
     if a == b and c != d and c != a and d != a:
         return "XXYZ"
-
-    # XYZZ - Last 2 same, first 2 different from each other and from last
     if c == d and a != b and a != c and b != c:
         return "XYZZ"
 
-    # SEQUENTIAL - Ascending or descending consecutive digits
     digits = [int(ch) for ch in num_str]
     diffs = [digits[i + 1] - digits[i] for i in range(3)]
     if diffs == [1, 1, 1] or diffs == [-1, -1, -1]:
@@ -104,18 +116,9 @@ def categorize_number(num_str: str) -> str:
     return "OTHER"
 
 
-# =============================================================================
-# Determine availability from an element's background color
-# =============================================================================
+# ─── Availability Detection ─────────────────────────────────────────────────
 def get_availability(label_element) -> str:
-    """
-    Determine if a number is available or booked by checking its
-    background color via two methods for reliability.
-    
-    Available: #e4f8e7 → rgba(228, 248, 231, 1)
-    Booked:    #ff8900 → rgba(255, 137, 0, 1)
-    """
-    # Method 1: Computed CSS (Selenium normalizes to rgba)
+    """Determine if a number is available or booked by background color."""
     bg = (label_element.value_of_css_property("background-color") or "").lower().replace(" ", "")
 
     if "228,248,231" in bg:
@@ -123,7 +126,6 @@ def get_availability(label_element) -> str:
     if "255,137,0" in bg:
         return "No"
 
-    # Method 2: Raw style attribute (hex colors)
     style = (label_element.get_attribute("style") or "").lower()
     if "e4f8e7" in style:
         return "Yes"
@@ -133,14 +135,9 @@ def get_availability(label_element) -> str:
     return "Unknown"
 
 
-# =============================================================================
-# PrimeFaces Dropdown Helper
-# =============================================================================
+# ─── PrimeFaces Dropdown Helper ──────────────────────────────────────────────
 def select_primefaces_dropdown(driver, wait, dropdown_id: str, value_text: str):
-    """
-    Select a value from a PrimeFaces SelectOneMenu dropdown.
-    These are NOT standard <select> elements — they use custom UI.
-    """
+    """Select a value from a PrimeFaces SelectOneMenu dropdown."""
     label = wait.until(EC.element_to_be_clickable((By.ID, f"{dropdown_id}_label")))
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", label)
     time.sleep(0.5)
@@ -156,26 +153,20 @@ def select_primefaces_dropdown(driver, wait, dropdown_id: str, value_text: str):
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
             time.sleep(0.3)
             item.click()
-            print(f"  ✓ Selected '{value_text}' in '{dropdown_id}'")
             return True
 
-    # Fallback: partial match
     for item in items:
         if value_text.upper() in item.text.strip().upper():
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
             time.sleep(0.3)
             item.click()
-            print(f"  ✓ Selected '{item.text.strip()}' (partial) in '{dropdown_id}'")
             return True
 
-    print(f"  ✗ Could not find '{value_text}' in '{dropdown_id}'")
     return False
 
 
-# =============================================================================
-# Extract numbers from current page
-# =============================================================================
-def extract_numbers_from_page(driver) -> list[dict]:
+# ─── Page Extraction ─────────────────────────────────────────────────────────
+def extract_numbers_from_page(driver, series: str) -> list[dict]:
     """Extract all numbers from the currently visible datagrid page."""
     numbers = []
     content = driver.find_element(By.ID, "dtgavailablenumbers_content")
@@ -193,7 +184,9 @@ def extract_numbers_from_page(driver) -> list[dict]:
         category = categorize_number(number_text)
 
         numbers.append({
+            "series": series,
             "number": number_text,
+            "final_number": f"{series}{number_text}",
             "available": available,
             "category": category,
         })
@@ -201,67 +194,60 @@ def extract_numbers_from_page(driver) -> list[dict]:
     return numbers
 
 
-# =============================================================================
-# CSV helpers — incremental write & resume
-# =============================================================================
-CSV_FIELDS = ["number", "available", "category"]
+# ─── CSV Helpers ─────────────────────────────────────────────────────────────
+def get_output_file(series: str) -> Path:
+    return OUTPUT_DIR / f"{series}_numbers.csv"
 
 
-def get_resume_page() -> int:
-    """
-    Check the existing CSV to determine which page to resume from.
-    Returns the 1-based page number to start scraping from.
-    If no CSV exists or it's empty, returns 1.
-    """
-    if not OUTPUT_FILE.exists():
+def get_resume_page(series: str) -> int:
+    """Check the existing CSV to determine which page to resume from."""
+    output_file = get_output_file(series)
+    if not output_file.exists():
         return 1
 
     try:
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        with open(output_file, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             row_count = sum(1 for _ in reader)
 
         if row_count == 0:
             return 1
 
-        # Each page has NUMBERS_PER_PAGE numbers
         completed_pages = row_count // NUMBERS_PER_PAGE
         resume_page = completed_pages + 1
-        print(f"  Found existing CSV with {row_count} numbers ({completed_pages} full pages).")
-        print(f"  Resuming from page {resume_page}.")
+        console.print(f"  Found existing CSV with [cyan]{row_count}[/] numbers ([cyan]{completed_pages}[/] full pages).")
+        console.print(f"  Resuming from page [cyan]{resume_page}[/].")
         return resume_page
-    except Exception as e:
-        print(f"  Warning: Could not read existing CSV ({e}), starting fresh.")
+    except Exception:
         return 1
 
 
-def append_to_csv(rows: list[dict]):
-    """Append rows to the CSV file, creating it with headers if it doesn't exist."""
-    file_exists = OUTPUT_FILE.exists() and OUTPUT_FILE.stat().st_size > 0
+def append_to_csv(series: str, rows: list[dict]):
+    """Append rows to the CSV file, creating it with headers if needed."""
+    output_file = get_output_file(series)
+    file_exists = output_file.exists() and output_file.stat().st_size > 0
 
-    with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as f:
+    with open(output_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if not file_exists:
             writer.writeheader()
         writer.writerows(rows)
 
 
-def read_existing_numbers() -> list[dict]:
+def read_existing_numbers(series: str) -> list[dict]:
     """Read all existing numbers from the CSV (for summary stats)."""
-    if not OUTPUT_FILE.exists():
+    output_file = get_output_file(series)
+    if not output_file.exists():
         return []
     try:
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+        with open(output_file, "r", encoding="utf-8") as f:
             return list(csv.DictReader(f))
     except Exception:
         return []
 
 
-# =============================================================================
-# Get total page count from paginator
-# =============================================================================
+# ─── Paginator Helpers ───────────────────────────────────────────────────────
 def get_total_pages(driver) -> int:
-    """Parse the paginator text '(X of N)' to get N."""
     try:
         paginator = driver.find_element(
             By.CSS_SELECTOR, "#dtgavailablenumbers_paginator_top .ui-paginator-current"
@@ -270,52 +256,12 @@ def get_total_pages(driver) -> int:
         match = re.search(r"\((\d+)\s+of\s+(\d+)\)", text)
         if match:
             return int(match.group(2))
-    except Exception as e:
-        print(f"  Warning: Could not parse total pages: {e}")
+    except Exception:
+        pass
     return 1
 
 
-# =============================================================================
-# Navigate to a specific page in the paginator
-# =============================================================================
-def navigate_to_page(driver, target_page: int, total_pages: int):
-    """
-    Navigate to a specific page by clicking Next repeatedly.
-    PrimeFaces paginators don't support direct page jumps easily,
-    so we click through sequentially.
-    """
-    current = get_current_page(driver)
-    if current == target_page:
-        return
-
-    print(f"  Fast-forwarding from page {current} to page {target_page}...")
-    while current < target_page:
-        next_btn = driver.find_element(
-            By.CSS_SELECTOR,
-            "#dtgavailablenumbers_paginator_top .ui-paginator-next",
-        )
-        btn_classes = next_btn.get_attribute("class") or ""
-        if "ui-state-disabled" in btn_classes:
-            print(f"  ⚠ Next button disabled at page {current}")
-            break
-
-        next_btn.click()
-        time.sleep(PAGE_DELAY)
-
-        # Wait for page to update
-        for _ in range(10):
-            new_page = get_current_page(driver)
-            if new_page > current:
-                current = new_page
-                break
-            time.sleep(1)
-
-        if current % 10 == 0:
-            print(f"    ... at page {current}")
-
-
 def get_current_page(driver) -> int:
-    """Get the current page number from the paginator."""
     try:
         paginator = driver.find_element(
             By.CSS_SELECTOR, "#dtgavailablenumbers_paginator_top .ui-paginator-current"
@@ -329,21 +275,252 @@ def get_current_page(driver) -> int:
     return 1
 
 
-# =============================================================================
-# Main scraping flow
-# =============================================================================
-def main():
-    print("=" * 60)
-    print("  Parivahan Fancy Number Fetcher")
-    print("=" * 60)
-    print()
+def navigate_to_page(driver, target_page: int):
+    """Navigate to a specific page by clicking Next repeatedly."""
+    current = get_current_page(driver)
+    if current == target_page:
+        return
 
-    # Check for resume
-    start_page = get_resume_page()
-    print()
+    console.print(f"  Fast-forwarding from page [cyan]{current}[/] → [cyan]{target_page}[/]...")
+    while current < target_page:
+        next_btn = driver.find_element(
+            By.CSS_SELECTOR,
+            "#dtgavailablenumbers_paginator_top .ui-paginator-next",
+        )
+        btn_classes = next_btn.get_attribute("class") or ""
+        if "ui-state-disabled" in btn_classes:
+            break
 
-    # ── Launch Chrome ──────────────────────────────────────────
-    print("[1/5] Launching Chrome browser...")
+        next_btn.click()
+        time.sleep(PAGE_DELAY)
+
+        for _ in range(10):
+            new_page = get_current_page(driver)
+            if new_page > current:
+                current = new_page
+                break
+            time.sleep(1)
+
+
+# ─── Scrape a Single Series ──────────────────────────────────────────────────
+def scrape_series(driver, wait, series: str, series_idx: int, total_series: int):
+    """Scrape all pages for a single vehicle series."""
+    console.print()
+    console.rule(f"[bold cyan]Series {series_idx}/{total_series}: {series}[/]")
+
+    start_page = get_resume_page(series)
+
+    # Select dropdowns
+    console.print("  Selecting [yellow]Fuel Type[/]...")
+    select_primefaces_dropdown(driver, wait, "sel_fuel_type", FUEL_TYPE)
+    time.sleep(DROPDOWN_DELAY)
+
+    console.print("  Selecting [yellow]Vehicle Category[/]...")
+    select_primefaces_dropdown(driver, wait, "ib_stateb", "LIGHT MOTOR VEHICLE")
+    time.sleep(DROPDOWN_DELAY)
+
+    console.print("  Selecting [yellow]Vehicle Series[/] → [bold green]{series}[/]...".format(series=series))
+    select_primefaces_dropdown(driver, wait, "ib_Veh_Seri", series)
+    time.sleep(DROPDOWN_DELAY)
+
+    console.print("  Waiting for page to settle...")
+    time.sleep(3)
+
+    # Click "Registration Number Status"
+    console.print("  Clicking [bold]Registration Number Status[/]...")
+    btn = wait.until(EC.element_to_be_clickable((By.ID, "checknumberid")))
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+    time.sleep(1)
+    btn.click()
+
+    console.print("  Waiting for numbers to load...")
+    time.sleep(5)
+    wait.until(EC.presence_of_element_located((By.ID, "dtgavailablenumbers_content")))
+    console.print("  [bold green]✓[/] Numbers grid loaded!")
+
+    # Scrape
+    total_pages = get_total_pages(driver)
+    console.print(f"  Total pages: [cyan]{total_pages}[/]")
+
+    if start_page > 1:
+        navigate_to_page(driver, start_page)
+
+    fetched_this_run = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=30),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            f"  [cyan]{series}[/]",
+            total=total_pages,
+            completed=start_page - 1,
+        )
+
+        for page_num in range(start_page, total_pages + 1):
+            page_numbers = extract_numbers_from_page(driver, series)
+            append_to_csv(series, page_numbers)
+            fetched_this_run += len(page_numbers)
+
+            avail = sum(1 for n in page_numbers if n["available"] == "Yes")
+            booked = sum(1 for n in page_numbers if n["available"] == "No")
+
+            progress.update(task, completed=page_num, description=(
+                f"  [cyan]{series}[/] pg {page_num}/{total_pages} "
+                f"([green]✓{avail}[/] [red]✗{booked}[/]) — "
+                f"total: {fetched_this_run}"
+            ))
+
+            if page_num < total_pages:
+                try:
+                    next_btn = driver.find_element(
+                        By.CSS_SELECTOR,
+                        "#dtgavailablenumbers_paginator_top .ui-paginator-next",
+                    )
+                    btn_classes = next_btn.get_attribute("class") or ""
+                    if "ui-state-disabled" in btn_classes:
+                        console.print("  [yellow]⚠[/] Next button disabled — stopping.")
+                        break
+
+                    next_btn.click()
+                    time.sleep(PAGE_DELAY)
+
+                    for _ in range(10):
+                        try:
+                            pag = driver.find_element(
+                                By.CSS_SELECTOR,
+                                "#dtgavailablenumbers_paginator_top .ui-paginator-current",
+                            )
+                            if f"({page_num + 1} of" in pag.text.strip():
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(1)
+
+                except Exception as e:
+                    console.print(f"  [yellow]⚠[/] Navigation error: {e}")
+                    console.print("  Retrying...")
+                    time.sleep(5)
+                    try:
+                        next_btn = driver.find_element(
+                            By.CSS_SELECTOR,
+                            "#dtgavailablenumbers_paginator_top .ui-paginator-next",
+                        )
+                        next_btn.click()
+                        time.sleep(PAGE_DELAY + 2)
+                    except Exception:
+                        console.print("  [red]✗[/] Retry failed — saving progress.")
+                        break
+
+    # Series summary
+    output_file = get_output_file(series)
+    console.print(f"\n  [bold green]✓[/] Done! Fetched [cyan]{fetched_this_run}[/] numbers this run.")
+    console.print(f"  [bold green]✓[/] CSV: [link=file://{output_file}]{output_file}[/]")
+
+    return fetched_this_run
+
+
+def print_series_summary(series: str):
+    """Print a Rich table summary for a completed series."""
+    all_numbers = read_existing_numbers(series)
+    if not all_numbers:
+        return
+
+    total = len(all_numbers)
+    avail = sum(1 for n in all_numbers if n.get("available") == "Yes")
+    booked = sum(1 for n in all_numbers if n.get("available") == "No")
+    unknown = total - avail - booked
+
+    table = Table(title=f"Summary — {series}", show_header=True, header_style="bold magenta")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Count", justify="right", style="green")
+    table.add_row("Total Numbers", str(total))
+    table.add_row("Available", str(avail))
+    table.add_row("Booked", str(booked))
+    if unknown:
+        table.add_row("Unknown", str(unknown))
+
+    console.print()
+    console.print(table)
+
+    # Category breakdown
+    categories: dict[str, int] = {}
+    for entry in all_numbers:
+        cat = entry.get("category", "OTHER")
+        categories[cat] = categories.get(cat, 0) + 1
+
+    cat_table = Table(title=f"Category Breakdown — {series}", show_header=True, header_style="bold magenta")
+    cat_table.add_column("Category", style="cyan")
+    cat_table.add_column("Count", justify="right", style="green")
+    for cat in sorted(categories.keys()):
+        cat_table.add_row(cat, str(categories[cat]))
+
+    console.print(cat_table)
+
+
+# ─── Interactive Series Selection ────────────────────────────────────────────
+def prompt_series_selection() -> list[str]:
+    """Show an interactive multi-select prompt for vehicle series."""
+    choices = [
+        {"name": "Select All", "value": "__ALL__"},
+        Separator("─" * 30),
+        *[{"name": s, "value": s} for s in ALL_SERIES],
+    ]
+
+    selected = inquirer.checkbox(
+        message="Select vehicle series to fetch:",
+        choices=choices,
+        instruction="(Space to toggle, Enter to confirm)",
+        validate=lambda result: len(result) > 0,
+        invalid_message="You must select at least one series.",
+        transformer=lambda result: f"{len(result)} series selected",
+    ).execute()
+
+    if "__ALL__" in selected:
+        return list(ALL_SERIES)
+
+    return selected
+
+
+# ─── Main CLI Command ────────────────────────────────────────────────────────
+@app.command()
+def fetch():
+    """
+    🚗 Fetch fancy car registration numbers from Parivahan.
+
+    Launches a browser, lets you log in manually, then scrapes
+    all number plates for the selected vehicle series.
+    """
+
+    # Banner
+    banner = Text()
+    banner.append("🚗 Parivahan Fancy Number Fetcher\n", style="bold cyan")
+    banner.append("   Fetch & categorize Delhi vehicle registration numbers", style="dim")
+    console.print(Panel(banner, border_style="cyan", padding=(1, 2)))
+    console.print()
+
+    # ── Interactive series selection ──────────────────────────
+    selected_series = prompt_series_selection()
+
+    if not selected_series:
+        console.print("[red]No series selected. Exiting.[/]")
+        raise typer.Exit()
+
+    console.print()
+    series_list = ", ".join(f"[bold green]{s}[/]" for s in selected_series)
+    console.print(f"  Selected: {series_list}")
+    console.print()
+
+    # ── Ensure output directory exists ────────────────────────
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Launch Chrome ─────────────────────────────────────────
+    console.print("[bold]Launching Chrome browser...[/]")
     chrome_options = Options()
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -360,179 +537,82 @@ def main():
     wait = WebDriverWait(driver, 30)
 
     try:
-        # ── Navigate to login page ────────────────────────────
-        print(f"[2/5] Navigating to {LOGIN_URL}")
+        # ── Navigate & login ──────────────────────────────────
+        console.print(f"Navigating to [link={LOGIN_URL}]{LOGIN_URL}[/]")
         driver.get(LOGIN_URL)
         time.sleep(2)
 
-        print()
-        print("  ┌─────────────────────────────────────────────────┐")
-        print("  │  Please LOG IN manually in the browser window.  │")
-        print("  │  Complete: username, password, OTP, captcha.    │")
-        print("  │                                                 │")
-        print("  │  After login, come back here and press ENTER.   │")
-        print("  └─────────────────────────────────────────────────┘")
-        print()
-        input("  >>> Press ENTER after you have logged in... ")
-        print()
+        console.print()
+        console.print(
+            Panel(
+                "[bold yellow]Please LOG IN manually in the browser window.[/]\n"
+                "Complete: username, password, OTP, captcha.\n\n"
+                "[dim]After login, come back here and press ENTER.[/]",
+                title="🔐 Manual Login Required",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
 
-        # ── Check if we're on the home page ───────────────────
+        input("  >>> Press ENTER after you have logged in... ")
+        console.print()
+
         current_url = driver.current_url
         if "applicanthome" not in current_url:
-            print("  Navigating to home page...")
+            console.print("  Navigating to home page...")
             driver.get(HOME_URL)
             time.sleep(3)
 
-        # ── Select Dropdowns ──────────────────────────────────
-        print("[3/5] Selecting vehicle details...")
-        print()
+        # ── Process each selected series ──────────────────────
+        total_fetched = 0
+        for idx, series in enumerate(selected_series, 1):
+            try:
+                count = scrape_series(driver, wait, series, idx, len(selected_series))
+                total_fetched += count
+                print_series_summary(series)
+            except KeyboardInterrupt:
+                console.print(f"\n  [yellow]Interrupted during {series}![/] Progress saved.")
+                break
+            except Exception as e:
+                console.print(f"\n  [red]✗ Error on {series}: {e}[/]")
+                import traceback
+                traceback.print_exc()
+                console.print(f"  Progress saved. Continuing to next series...")
+                continue
 
-        print("  Selecting Fuel Type...")
-        select_primefaces_dropdown(driver, wait, "sel_fuel_type", FUEL_TYPE)
-        time.sleep(DROPDOWN_DELAY)
+            # Navigate back to home for next series
+            if idx < len(selected_series):
+                console.print("\n  Navigating back for next series...")
+                driver.get(HOME_URL)
+                time.sleep(3)
 
-        print("  Selecting Vehicle Category...")
-        select_primefaces_dropdown(driver, wait, "ib_stateb", "LIGHT MOTOR VEHICLE")
-        time.sleep(DROPDOWN_DELAY)
+        # ── Final summary ─────────────────────────────────────
+        console.print()
+        console.print(Panel(
+            f"[bold green]✓ All done![/]\n"
+            f"Fetched [cyan]{total_fetched}[/] numbers across "
+            f"[cyan]{len(selected_series)}[/] series.\n"
+            f"CSVs saved to: [bold]{OUTPUT_DIR}[/]",
+            title="🏁 Complete",
+            border_style="green",
+            padding=(1, 2),
+        ))
 
-        print("  Selecting Vehicle Series...")
-        select_primefaces_dropdown(driver, wait, "ib_Veh_Seri", VEHICLE_SERIES)
-        time.sleep(DROPDOWN_DELAY)
-
-        print()
-        print("  All dropdowns selected. Waiting for page to settle...")
-        time.sleep(3)
-
-        # ── Click "Registration Number Status" button ─────────
-        print("[4/5] Clicking 'Registration Number Status' button...")
-        btn = wait.until(EC.element_to_be_clickable((By.ID, "checknumberid")))
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-        time.sleep(1)
-        btn.click()
-
-        print("  Waiting for numbers to load...")
-        time.sleep(5)
-        wait.until(EC.presence_of_element_located((By.ID, "dtgavailablenumbers_content")))
-        print("  ✓ Numbers grid loaded!")
-        print()
-
-        # ── Scrape all pages ──────────────────────────────────
-        print("[5/5] Scraping all pages...")
-        total_pages = get_total_pages(driver)
-        print(f"  Total pages: {total_pages}")
-
-        if start_page > 1:
-            navigate_to_page(driver, start_page, total_pages)
-
-        print()
-
-        fetched_this_run = 0
-        for page_num in range(start_page, total_pages + 1):
-            # Extract numbers from current page
-            page_numbers = extract_numbers_from_page(driver)
-
-            # Write to CSV immediately
-            append_to_csv(page_numbers)
-            fetched_this_run += len(page_numbers)
-
-            available_count = sum(1 for n in page_numbers if n["available"] == "Yes")
-            booked_count = sum(1 for n in page_numbers if n["available"] == "No")
-            print(
-                f"  Page {page_num:3d}/{total_pages} — "
-                f"{len(page_numbers):3d} numbers "
-                f"(✓{available_count} avail, ✗{booked_count} booked) — "
-                f"Total this run: {fetched_this_run}"
-            )
-
-            # Navigate to next page
-            if page_num < total_pages:
-                try:
-                    next_btn = driver.find_element(
-                        By.CSS_SELECTOR,
-                        "#dtgavailablenumbers_paginator_top .ui-paginator-next",
-                    )
-                    btn_classes = next_btn.get_attribute("class") or ""
-                    if "ui-state-disabled" in btn_classes:
-                        print("  ⚠ Next button disabled — stopping.")
-                        break
-
-                    next_btn.click()
-                    time.sleep(PAGE_DELAY)
-
-                    # Wait for page to actually update
-                    for _ in range(10):
-                        try:
-                            pag = driver.find_element(
-                                By.CSS_SELECTOR,
-                                "#dtgavailablenumbers_paginator_top .ui-paginator-current",
-                            )
-                            if f"({page_num + 1} of" in pag.text.strip():
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(1)
-
-                except Exception as e:
-                    print(f"  ⚠ Error navigating to page {page_num + 1}: {e}")
-                    print("  Retrying...")
-                    time.sleep(5)
-                    try:
-                        next_btn = driver.find_element(
-                            By.CSS_SELECTOR,
-                            "#dtgavailablenumbers_paginator_top .ui-paginator-next",
-                        )
-                        next_btn.click()
-                        time.sleep(PAGE_DELAY + 2)
-                    except Exception as e2:
-                        print(f"  ✗ Retry failed: {e2} — saving progress.")
-                        break
-
-        # ── Summary ───────────────────────────────────────────
-        print()
-        print(f"  ✓ Done! Fetched {fetched_this_run} numbers this run.")
-        print(f"  ✓ CSV: {OUTPUT_FILE}")
-        print()
-
-        # Read full CSV for summary
-        all_numbers = read_existing_numbers()
-        total = len(all_numbers)
-        avail = sum(1 for n in all_numbers if n.get("available") == "Yes")
-        booked = sum(1 for n in all_numbers if n.get("available") == "No")
-        unknown = total - avail - booked
-
-        print("  ── Summary ──────────────────────────────────────")
-        print(f"  Total numbers:  {total}")
-        print(f"  Available:      {avail}")
-        print(f"  Booked:         {booked}")
-        if unknown:
-            print(f"  Unknown:        {unknown}")
-        print()
-
-        categories = {}
-        for entry in all_numbers:
-            cat = entry.get("category", "OTHER")
-            categories[cat] = categories.get(cat, 0) + 1
-
-        print("  ── Category Breakdown ────────────────────────────")
-        for cat in sorted(categories.keys()):
-            print(f"   {cat:12s}  {categories[cat]:5d} numbers")
-        print()
-
-        input("  >>> Press ENTER to close the browser and exit... ")
+        input("\n  >>> Press ENTER to close the browser and exit... ")
 
     except KeyboardInterrupt:
-        print(f"\n  Interrupted! Progress saved to: {OUTPUT_FILE}")
-        print(f"  Re-run the script to resume from where you left off.")
+        console.print(f"\n  [yellow]Interrupted![/] Progress saved to: [bold]{OUTPUT_DIR}[/]")
+        console.print("  Re-run the script to resume from where you left off.")
     except Exception as e:
-        print(f"\n  ✗ Error: {e}")
+        console.print(f"\n  [red]✗ Error: {e}[/]")
         import traceback
         traceback.print_exc()
-        print(f"\n  Progress saved to: {OUTPUT_FILE}")
-        print(f"  Re-run the script to resume from where you left off.")
+        console.print(f"\n  Progress saved to: [bold]{OUTPUT_DIR}[/]")
+        console.print("  Re-run the script to resume from where you left off.")
         input("\n  >>> Press ENTER to close the browser and exit... ")
     finally:
         driver.quit()
 
 
 if __name__ == "__main__":
-    main()
+    app()
